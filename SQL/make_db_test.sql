@@ -1662,7 +1662,7 @@ CREATE OR REPLACE DEFINER = CURRENT_USER
 `proc_body`:
 BEGIN
 
-    INSERT INTO depotdbtest.price (
+    INSERT IGNORE INTO depotdbtest.price (
          symid
         ,valuedate
         ,`open`
@@ -1694,6 +1694,22 @@ CREATE OR REPLACE DEFINER = CURRENT_USER
     COMMENT 'Batch insert data from etl_price_adjustment to price_adjustment'
 `proc_body`:
 BEGIN
+    DECLARE l_has_odd_entries BOOLEAN DEFAULT FALSE;
+    SELECT 
+        CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END INTO l_has_odd_entries
+    FROM etl_price_adjustment
+    WHERE vendor      IS NULL 
+      OR symbol       IS NULL 
+      OR valuedate    IS NULL 
+      OR close        = 0.0 
+      OR split_factor = 0.0 
+    LIMIT 1;
+    
+    IF l_has_odd_entries THEN                 
+        DELETE FROM depotdbtest.etl_price_adjustment;
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Bad corporate actions denied.';
+        LEAVE `proc_body`;
+    END IF;
 
     INSERT IGNORE INTO depotdbtest.price_adjustment (
          symid
@@ -1981,41 +1997,41 @@ Access rights management for app user and data admin
 ------------------------------------------------------------------------------*/
 
 /* user connecting to the system thru the app_read_user and his limited role */
-CREATE OR REPLACE                                                    ROLE test_app_read_user;
-GRANT SELECT ON depotdbtest.v_instrument_symbol                        TO test_app_read_user;
-GRANT SELECT ON depotdbtest.v_last_symbol_data                         TO test_app_read_user;
-GRANT SELECT ON depotdbtest.v_position                                 TO test_app_read_user;
-GRANT SELECT ON depotdbtest.v_price_adjusted                           TO test_app_read_user;
-GRANT SELECT ON depotdbtest.v_price_adjustment                         TO test_app_read_user;
-GRANT SELECT ON depotdbtest.v_trade                                    TO test_app_read_user;
-GRANT EXECUTE ON FUNCTION depotdbtest.is_valid_json_ticket_verbose     TO test_app_read_user;
-GRANT EXECUTE ON PROCEDURE depotdbtest.add_depot                       TO test_app_read_user;
-GRANT EXECUTE ON PROCEDURE depotdbtest.authenticate_user               TO test_app_read_user;
-GRANT EXECUTE ON PROCEDURE depotdbtest.book_ticket                     TO test_app_read_user;
-GRANT EXECUTE ON PROCEDURE depotdbtest.grant_depot_permission          TO test_app_read_user;
+CREATE OR REPLACE                                                    ROLE test_app_read_role;
+GRANT SELECT ON depotdbtest.v_instrument_symbol                        TO test_app_read_role;
+GRANT SELECT ON depotdbtest.v_last_symbol_data                         TO test_app_read_role;
+GRANT SELECT ON depotdbtest.v_position                                 TO test_app_read_role;
+GRANT SELECT ON depotdbtest.v_price_adjusted                           TO test_app_read_role;
+GRANT SELECT ON depotdbtest.v_price_adjustment                         TO test_app_read_role;
+GRANT SELECT ON depotdbtest.v_trade                                    TO test_app_read_role;
+GRANT EXECUTE ON FUNCTION depotdbtest.is_valid_json_ticket_verbose     TO test_app_read_role;
+GRANT EXECUTE ON PROCEDURE depotdbtest.add_depot                       TO test_app_read_role;
+GRANT EXECUTE ON PROCEDURE depotdbtest.authenticate_user               TO test_app_read_role;
+GRANT EXECUTE ON PROCEDURE depotdbtest.book_ticket                     TO test_app_read_role;
+GRANT EXECUTE ON PROCEDURE depotdbtest.grant_depot_permission          TO test_app_read_role;
 
 CREATE OR REPLACE USER 'TEST_APP_READ_USER'@'%' IDENTIFIED BY 'temporarypassword';
 GRANT USAGE ON depotdbtest.* TO 'TEST_APP_READ_USER'@'%' WITH 
     MAX_USER_CONNECTIONS 10
     MAX_STATEMENT_TIME   60;
-GRANT test_app_read_user TO 'TEST_APP_READ_USER'@'%';
-SET DEFAULT ROLE test_app_read_user FOR 'TEST_APP_READ_USER'@'%';
+GRANT test_app_read_role TO 'TEST_APP_READ_USER'@'%';
+SET DEFAULT ROLE test_app_read_role FOR 'TEST_APP_READ_USER'@'%';
 SET PASSWORD FOR 'TEST_APP_READ_USER'@'%' = '*9A3C6F8D9856E5807DA2C7470C606847F5B996C8';
 
 /* app admin user may insert market data, instruments, new users 
    PLUS the read role
 */
-CREATE OR REPLACE                                                    ROLE test_app_admin_user;
-GRANT test_app_read_user                                               TO test_app_admin_user;
-GRANT INSERT ON depotdbtest.etl_price                                  TO test_app_admin_user;
-GRANT INSERT ON depotdbtest.etl_price_adjustment                       TO test_app_admin_user;
-GRANT EXECUTE ON PROCEDURE depotdbtest.add_instrument                  TO test_app_admin_user;
-GRANT EXECUTE ON PROCEDURE depotdbtest.add_or_update_price_adjustment  TO test_app_admin_user;
-GRANT EXECUTE ON PROCEDURE depotdbtest.add_or_update_symbol            TO test_app_admin_user;
-GRANT EXECUTE ON PROCEDURE depotdbtest.add_user                        TO test_app_admin_user;
-GRANT EXECUTE ON PROCEDURE depotdbtest.add_vendor_market               TO test_app_admin_user;
-GRANT EXECUTE ON PROCEDURE depotdbtest.load_price_from_etl             TO test_app_admin_user;
-GRANT EXECUTE ON PROCEDURE depotdbtest.load_price_adjustment_from_etl  TO test_app_admin_user;
+CREATE OR REPLACE                                                    ROLE test_app_admin_role;
+GRANT test_app_read_role                                               TO test_app_admin_role;
+GRANT INSERT ON depotdbtest.etl_price                                  TO test_app_admin_role;
+GRANT INSERT ON depotdbtest.etl_price_adjustment                       TO test_app_admin_role;
+GRANT EXECUTE ON PROCEDURE depotdbtest.add_instrument                  TO test_app_admin_role;
+GRANT EXECUTE ON PROCEDURE depotdbtest.add_or_update_price_adjustment  TO test_app_admin_role;
+GRANT EXECUTE ON PROCEDURE depotdbtest.add_or_update_symbol            TO test_app_admin_role;
+GRANT EXECUTE ON PROCEDURE depotdbtest.add_user                        TO test_app_admin_role;
+GRANT EXECUTE ON PROCEDURE depotdbtest.add_vendor_market               TO test_app_admin_role;
+GRANT EXECUTE ON PROCEDURE depotdbtest.load_price_from_etl             TO test_app_admin_role;
+GRANT EXECUTE ON PROCEDURE depotdbtest.load_price_adjustment_from_etl  TO test_app_admin_role;
 
 
 
@@ -2023,8 +2039,8 @@ CREATE OR REPLACE USER 'TEST_APP_ADMIN_USER'@'%' IDENTIFIED BY 'temporarypasswor
 GRANT USAGE ON depotdbtest.* TO 'TEST_APP_ADMIN_USER'@'%' WITH 
     MAX_USER_CONNECTIONS 10
     MAX_STATEMENT_TIME   60;
-GRANT test_app_admin_user TO 'TEST_APP_ADMIN_USER'@'%';
-SET DEFAULT ROLE test_app_admin_user FOR 'TEST_APP_ADMIN_USER'@'%';
+GRANT test_app_admin_role TO 'TEST_APP_ADMIN_USER'@'%';
+SET DEFAULT ROLE test_app_admin_role FOR 'TEST_APP_ADMIN_USER'@'%';
 SET PASSWORD FOR 'TEST_APP_ADMIN_USER'@'%' = '*5DD735CE405F03AA14ABE4ECC9976F089BCC73DD';
 FLUSH PRIVILEGES;
 
