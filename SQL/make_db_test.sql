@@ -447,18 +447,18 @@ CREATE UNIQUE   INDEX idxsymun1 ON depotdbtest.symbol(insid,venid,mktid,ccy);
 CREATE UNIQUE   INDEX idxsymun2 ON depotdbtest.symbol(venid,symbol); 
 
 /* active symbol, i.e. leading symbol per instrument/ccy combination */
-/* CREATE TABLE 
+CREATE TABLE 
   depotdbtest.active_symbol (
     insid           SMALLINT UNSIGNED NOT NULL 
    ,ccy             CHAR(3) NOT NULL
    ,symid           SMALLINT UNSIGNED NOT NULL
    ,lastedit        TIMESTAMP
    ,CONSTRAINT PRIMARY KEY (insid,ccy)
-   ,FOREIGN KEY fkactsymins (insid) REFERENCES depotdbtest.instrument(insid) ON DELETE RESTRICT
+   ,FOREIGN KEY fkactsymins (insid) REFERENCES depotdbtest.instrument(insid) ON DELETE CASCADE
    ,FOREIGN KEY fkactsymccy (ccy) REFERENCES depotdbtest.currency(ccy) ON DELETE RESTRICT
    ,FOREIGN KEY fkactsymsym (symid) REFERENCES depotdbtest.symbol(symid) ON DELETE RESTRICT
 );
-*/
+
 
 /* price table stores unadjusted prices  
 */
@@ -1764,6 +1764,94 @@ END; //
 DELIMITER ;
 
 /*------------------------------------------------------------------------------
+   ___                           _                     
+  / __\___  _ ____   _____ _ __ (_) ___ _ __   ___ ___ 
+ / /  / _ \| '_ \ \ / / _ \ '_ \| |/ _ \ '_ \ / __/ _ \
+/ /__| (_) | | | \ V /  __/ | | | |  __/ | | | (_|  __/
+\____/\___/|_| |_|\_/ \___|_| |_|_|\___|_| |_|\___\___|
+Procedures for valuing the position, trades, cash flows etc.
+------------------------------------------------------------------------------*/
+
+/* position as of a date */
+DELIMITER //
+CREATE OR REPLACE
+    DEFINER = CURRENT_USER
+    PROCEDURE depotdbtest.position_as_of(IN in_date DATE)
+    SQL SECURITY DEFINER
+    MODIFIES SQL DATA
+    COMMENT 'Return the position (verbose) as of a date'
+`proc_body`:
+BEGIN
+
+SELECT
+     v.depot_owner
+    ,v.depot_broker
+    ,v.depot_external_id
+    ,v.depot_ccy
+    ,v.isin
+    ,v.ins_ccy
+    ,v.pos_valuedate
+    ,v.pos_qty
+    ,v.pos_vol
+    ,v.pos_ccy 
+FROM        depotdbtest.v_position v 
+INNER JOIN (SELECT v0.depid,v0.insid,v0.pos_ccy, MAX(v0.pos_valuedate) AS lastdate 
+            FROM   depotdbtest.v_position v0 
+            WHERE  v0.pos_valuedate <= in_date 
+            GROUP BY v0.depid,v0.insid,v0.pos_ccy) vmax 
+ON          v.depid = vmax.depid 
+AND         v.insid = vmax.insid 
+AND       v.pos_ccy = vmax.pos_ccy 
+AND v.pos_valuedate = vmax.lastdate 
+WHERE v.pos_qty <> 0 ;
+
+END;
+//
+DELIMITER ;
+
+/* last available market as of a date */
+DELIMITER //
+CREATE OR REPLACE
+    DEFINER = CURRENT_USER
+    PROCEDURE depotdbtest.market_as_of(IN in_date DATE)
+    SQL SECURITY DEFINER
+    MODIFIES SQL DATA
+    COMMENT 'Return the market by isin as of a date'
+`proc_body`:
+BEGIN
+
+SELECT 
+     i.isin
+    ,asym.ccy
+    ,prc.valuedate
+    ,prc.open
+    ,prc.high
+    ,prc.low
+    ,prc.close
+    ,CAST(prc.close * COALESCE(pa.adj_factor,1) AS DECIMAL(10,4)) AS fClose 
+    ,prc.volume
+FROM       depotdbtest.instrument i 
+INNER JOIN depotdbtest.active_symbol asym 
+        ON i.insid = asym.insid
+INNER JOIN depotdbtest.price prc 
+        ON asym.symid = prc.symid 
+INNER JOIN ( SELECT p0.symid,MAX(p0.valuedate) as maxdate 
+             FROM depotdbtest.price p0 
+             WHERE p0.valuedate <= in_date 
+             GROUP BY p0.symid) pmax 
+       ON prc.symid = pmax.symid 
+      AND prc.valuedate = pmax.maxdate 
+LEFT JOIN depotdbtest.price_adjustment pa 
+       ON prc.symid = pa.symid 
+      AND prc.valuedate = pa.valuedate ;
+
+
+END;
+//
+DELIMITER ;
+
+
+/*------------------------------------------------------------------------------
    ___      _                  _                   
   / _ \_ __(_) ___ ___  /\   /(_) _____      _____ 
  / /_)/ '__| |/ __/ _ \ \ \ / / |/ _ \ \ /\ / / __|
@@ -1811,6 +1899,34 @@ INNER JOIN depotdbtest.price_adjustment par
         ON pal.symid = par.symid 
        AND pal.valuedate < par.valuedate
 GROUP BY pal.symid, pal.valuedate;
+
+/*------------------------------------------------------------------------------
+raw prices on instrument-isin level (for portfolio valuation etc.)
+------------------------------------------------------------------------------*/
+CREATE OR REPLACE
+    ALGORITHM = UNDEFINED
+    DEFINER = CURRENT_USER
+    SQL SECURITY DEFINER
+VIEW 
+    depotdbtest.v_market_by_isin_unadjusted
+AS
+SELECT 
+     i.isin
+    ,asym.ccy
+    ,prc.valuedate
+    ,prc.open
+    ,prc.high
+    ,prc.low
+    ,prc.close
+    ,prc.volume  
+FROM       depotdbtest.instrument i 
+INNER JOIN depotdbtest.active_symbol asym 
+        ON i.insid = asym.insid  
+INNER JOIN depotdbtest.price prc 
+        ON asym.symid = prc.symid;
+
+
+
 
 /*------------------------------------------------------------------------------
 dividend and split adjusted prices for performance evaluation purposes
@@ -1939,10 +2055,12 @@ VIEW
     depotdbtest.v_position
 AS
 SELECT 
-     v.depot_owner 
+     p.depid
+    ,v.depot_owner 
     ,v.depot_broker
     ,v.depot_external_id 
     ,v.depot_ccy
+    ,i.insid 
     ,i.isin
     ,i.ccy         AS ins_ccy
     ,p.valuedate   AS pos_valuedate
@@ -1952,6 +2070,7 @@ SELECT
 FROM depotdbtest.v_authenticated_user_permissions v 
 INNER JOIN depotdbtest.position p ON v.depot_id = p.depid 
 INNER JOIN depotdbtest.instrument i ON p.insid = i.insid
+
 WHERE v.permission & b'0001'
 WITH CHECK OPTION;
 
@@ -2002,10 +2121,13 @@ GRANT SELECT ON depotdbtest.v_instrument_symbol                        TO test_a
 GRANT SELECT ON depotdbtest.v_last_symbol_data                         TO test_app_read_role;
 GRANT SELECT ON depotdbtest.v_position                                 TO test_app_read_role;
 GRANT SELECT ON depotdbtest.v_price_adjusted                           TO test_app_read_role;
-GRANT SELECT ON depotdbtest.v_price_adjustment                         TO test_app_read_role;
+GRANT SELECT ON depotdbtest.v_market_by_isin_unadjusted                TO test_app_read_role;
+-- GRANT SELECT ON depotdbtest.v_price_adjustment                         TO test_app_read_role;
 GRANT SELECT ON depotdbtest.v_trade                                    TO test_app_read_role;
 GRANT EXECUTE ON FUNCTION depotdbtest.is_valid_json_ticket_verbose     TO test_app_read_role;
 GRANT EXECUTE ON PROCEDURE depotdbtest.add_depot                       TO test_app_read_role;
+GRANT EXECUTE ON PROCEDURE depotdbtest.position_as_of                  TO test_app_read_role;
+GRANT EXECUTE ON PROCEDURE depotdbtest.market_as_of                    TO test_app_read_role;
 GRANT EXECUTE ON PROCEDURE depotdbtest.authenticate_user               TO test_app_read_role;
 GRANT EXECUTE ON PROCEDURE depotdbtest.book_ticket                     TO test_app_read_role;
 GRANT EXECUTE ON PROCEDURE depotdbtest.grant_depot_permission          TO test_app_read_role;
