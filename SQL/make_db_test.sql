@@ -1613,7 +1613,9 @@ CREATE OR REPLACE DEFINER = CURRENT_USER
     ,IN in_symbol VARCHAR(12))
     SQL SECURITY DEFINER
     MODIFIES SQL DATA
-    COMMENT 'Introduce or update a symbol'
+    COMMENT 'Introduce or update a symbol. Per default, each new symbol gets
+             their starting price adjustment for 1999-12-31 and it is auto-
+             matically stored as the active_symbol for that instrument/ccy.'
 `proc_body`:
 BEGIN
     DECLARE l_venid TINYINT UNSIGNED DEFAULT NULL; 
@@ -1647,7 +1649,10 @@ BEGIN
     WHERE s.venid = l_venid AND s.symbol = in_symbol;
     
     INSERT IGNORE INTO depotdbtest.price_adjustment (symid, valuedate, close, dividend, split_factor, adj_factor) VALUES
-    (l_symid, '1999-12-31',0.0,0.0,1.0,1.0);
+    (l_symid, '1999-12-31',0.0,0.0,1.0,1.0),
+    (l_symid, '2099-12-31',0.0,0.0,1.0,1.0);
+    
+    INSERT IGNORE INTO depotdbtest.active_symbol (insid,ccy,symid) VALUES (l_insid, in_ccy, l_symid);
     
 END; //
 DELIMITER ;
@@ -1778,7 +1783,7 @@ CREATE OR REPLACE
     DEFINER = CURRENT_USER
     PROCEDURE depotdbtest.position_as_of(IN in_date DATE)
     SQL SECURITY DEFINER
-    MODIFIES SQL DATA
+    READS SQL DATA
     COMMENT 'Return the position (verbose) as of a date'
 `proc_body`:
 BEGIN
@@ -1790,7 +1795,7 @@ SELECT
     ,v.depot_ccy
     ,v.isin
     ,v.ins_ccy
-    ,v.pos_valuedate
+    ,CAST(v.pos_valuedate AS DATE) AS pos_valuedate
     ,v.pos_qty
     ,v.pos_vol
     ,v.pos_ccy 
@@ -1815,7 +1820,7 @@ CREATE OR REPLACE
     DEFINER = CURRENT_USER
     PROCEDURE depotdbtest.market_as_of(IN in_date DATE)
     SQL SECURITY DEFINER
-    MODIFIES SQL DATA
+    READS SQL DATA
     COMMENT 'Return the market by isin as of a date'
 `proc_body`:
 BEGIN
@@ -1823,7 +1828,7 @@ BEGIN
 SELECT 
      i.isin
     ,asym.ccy
-    ,prc.valuedate
+    ,CAST(prc.valuedate AS DATE) AS valuedate
     ,prc.open
     ,prc.high
     ,prc.low
@@ -1849,6 +1854,71 @@ LEFT JOIN depotdbtest.price_adjustment pa
 END;
 //
 DELIMITER ;
+
+/* all cashflows between two dates */
+DELIMITER //
+CREATE OR REPLACE
+    DEFINER = CURRENT_USER
+    PROCEDURE depotdbtest.cashflow_from_to(IN in_start DATE, IN in_end DATE)
+    SQL SECURITY DEFINER
+    READS SQL DATA
+    COMMENT 'Return all cashflows between start and end date, inclusive.'
+`proc_body`:
+BEGIN
+IF in_start IS NULL THEN 
+    SET in_start =  STR_TO_DATE(CONCAT(YEAR(CURDATE()),'0101'),'%Y%m%d');
+END IF;
+IF in_end IS NULL THEN
+    SET in_end = CURDATE();
+END IF;
+SELECT 
+     v.depot_owner
+    ,v.depot_broker
+    ,v.depot_external_id
+    ,v.depot_ccy
+    ,CAST(t.valuedate AS DATE) AS valuedate
+    ,i.isin
+    ,i.ccy AS ins_ccy
+    ,'payment' AS flow_class
+    ,p.paymenttype AS flow_type
+    ,p.amount AS flow_amount
+    ,p.ccy AS flow_ccy
+FROM       depotdbtest.v_authenticated_user_permissions v 
+INNER JOIN depotdbtest.trade t 
+        ON v.depot_id = t.depid 
+INNER JOIN depotdbtest.instrument i 
+        ON t.insid = i.insid  
+INNER JOIN depotdbtest.payment p 
+        ON t.trdid = p.trdid 
+WHERE v.permission & b'0001'
+  AND p.paymenttype NOT IN ('pnl')
+  AND t.valuedate BETWEEN in_start AND in_end
+
+UNION ALL 
+
+SELECT 
+     v.depot_owner
+    ,v.depot_broker
+    ,v.depot_external_id
+    ,v.depot_ccy
+    ,CAST(c.valuedate AS DATE) AS valuedate
+    ,i.isin
+    ,i.ccy AS ins_ccy
+    ,'cashflow' AS flow_class
+    ,c.cashflowtype AS flow_type
+    ,c.amount AS flow_amount
+    ,c.ccy AS flow_ccy
+FROM       depotdbtest.v_authenticated_user_permissions v 
+INNER JOIN depotdbtest.cashflow c 
+        ON v.depot_id = c.depid 
+INNER JOIN depotdbtest.instrument i 
+        ON c.insid = i.insid 
+WHERE v.permission & b'0001'
+  AND c.valuedate BETWEEN in_start AND in_end;
+END;
+//
+DELIMITER ;
+
 
 
 /*------------------------------------------------------------------------------
@@ -1908,22 +1978,26 @@ CREATE OR REPLACE
     DEFINER = CURRENT_USER
     SQL SECURITY DEFINER
 VIEW 
-    depotdbtest.v_market_by_isin_unadjusted
+    depotdbtest.v_market
 AS
-SELECT 
+SELECT     
      i.isin
     ,asym.ccy
-    ,prc.valuedate
-    ,prc.open
-    ,prc.high
-    ,prc.low
-    ,prc.close
-    ,prc.volume  
-FROM       depotdbtest.instrument i 
+    ,p.valuedate
+    ,p.`open`
+    ,p.high
+    ,p.low
+    ,p.close
+    ,CAST(p.`close` * pa.adj_factor AS DECIMAL(10,4)) AS `fClose`
+    ,p.volume 
+FROM       depotdbtest.price p 
 INNER JOIN depotdbtest.active_symbol asym 
-        ON i.insid = asym.insid  
-INNER JOIN depotdbtest.price prc 
-        ON asym.symid = prc.symid;
+        ON p.symid = asym.symid
+INNER JOIN depotdbtest.instrument i
+        ON i.insid = asym.insid
+INNER JOIN depotdbtest.v_price_adjustment pa 
+       ON p.symid = pa.symid 
+      AND p.valuedate BETWEEN pa.from_date AND pa.to_date;
 
 
 
@@ -1931,7 +2005,7 @@ INNER JOIN depotdbtest.price prc
 /*------------------------------------------------------------------------------
 dividend and split adjusted prices for performance evaluation purposes
 ------------------------------------------------------------------------------*/
-CREATE OR REPLACE 
+/*CREATE OR REPLACE 
     ALGORITHM = MERGE
     DEFINER = CURRENT_USER
     SQL SECURITY DEFINER
@@ -1950,7 +2024,7 @@ FROM depotdbtest.price p
 LEFT JOIN depotdbtest.v_price_adjustment pa 
        ON p.symid = pa.symid 
       AND p.valuedate BETWEEN pa.from_date AND pa.to_date;
-
+*/
 /*------------------------------------------------------------------------------
 instrument master data and corresponding vendorsymbols
 ------------------------------------------------------------------------------*/
@@ -2102,6 +2176,10 @@ INNER JOIN depotdbtest.instrument i ON t.insid = i.insid
 WHERE v.permission & b'0001'
 WITH CHECK OPTION;
 
+
+
+
+
 /*------------------------------------------------------------------------------
  _______  _______  _        _______  _______ 
 (  ____ )(  ___  )( \      (  ____ \(  ____ \
@@ -2120,14 +2198,14 @@ CREATE OR REPLACE                                                    ROLE test_a
 GRANT SELECT ON depotdbtest.v_instrument_symbol                        TO test_app_read_role;
 GRANT SELECT ON depotdbtest.v_last_symbol_data                         TO test_app_read_role;
 GRANT SELECT ON depotdbtest.v_position                                 TO test_app_read_role;
-GRANT SELECT ON depotdbtest.v_price_adjusted                           TO test_app_read_role;
-GRANT SELECT ON depotdbtest.v_market_by_isin_unadjusted                TO test_app_read_role;
+GRANT SELECT ON depotdbtest.v_market                                   TO test_app_read_role;
 -- GRANT SELECT ON depotdbtest.v_price_adjustment                         TO test_app_read_role;
 GRANT SELECT ON depotdbtest.v_trade                                    TO test_app_read_role;
 GRANT EXECUTE ON FUNCTION depotdbtest.is_valid_json_ticket_verbose     TO test_app_read_role;
 GRANT EXECUTE ON PROCEDURE depotdbtest.add_depot                       TO test_app_read_role;
 GRANT EXECUTE ON PROCEDURE depotdbtest.position_as_of                  TO test_app_read_role;
 GRANT EXECUTE ON PROCEDURE depotdbtest.market_as_of                    TO test_app_read_role;
+GRANT EXECUTE ON PROCEDURE depotdbtest.cashflow_from_to                TO test_app_read_role;
 GRANT EXECUTE ON PROCEDURE depotdbtest.authenticate_user               TO test_app_read_role;
 GRANT EXECUTE ON PROCEDURE depotdbtest.book_ticket                     TO test_app_read_role;
 GRANT EXECUTE ON PROCEDURE depotdbtest.grant_depot_permission          TO test_app_read_role;
