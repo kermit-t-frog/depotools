@@ -3,10 +3,11 @@ setwd("C:/Users/Kermit/Nextcloud/DEV/R/depotools/")
 library(depotr)
 library(iexcloudr)
 library(magrittr)
+depotr::initDB('localhost',3399,Sys.getenv('DEPOT_ADMINUSER'),Sys.getenv('DEPOT_ADMINPASS'),Sys.getenv('DEPOT_DBNAME'))
 make_testdb <- function(){shell(sprintf("cd SQL && make_test.bat \"%s\"",rstudioapi::askForPassword()))}
 make_testdb()
-iexcloudr::apikey(api_key =  Sys.getenv("IEXAPIKEYPUBLIC"),secret_key = Sys.getenv("IEXAPIKEYSECRET"),sandbox = TRUE)
-depotr::initDB('localhost',3399,Sys.getenv('DEPOT_ADMINUSER'),Sys.getenv('DEPOT_ADMINPASS'),Sys.getenv('DEPOT_DBNAME'))
+iexcloudr::apikey(api_key =  Sys.getenv("IEXAPIKEYPUBLIC"),secret_key = Sys.getenv("IEXAPIKEYSECRET"),sandbox = FALSE)
+
 
 depotr::add_user('kermit','miss piggy')
 depotr::authenticate('kermit','miss piggy')
@@ -23,6 +24,8 @@ readr::read_csv('C:/Users/Kermit/Nextcloud/DEV/R/depotools/data/corporate_action
   depotr::extract_corporate_actions() %>% 
   dplyr::mutate(vendor="IEX",.before=symbol) %>%
   depotr::store_corporate_actions()
+
+
   
 
 

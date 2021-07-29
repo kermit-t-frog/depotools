@@ -285,7 +285,7 @@ CREATE TABLE depotdbtest.instrument (
 );
 CREATE UNIQUE   INDEX idxinsisn ON depotdbtest.instrument(isin);
 CREATE          INDEX idxinsnam ON depotdbtest.instrument(name);
--- dummy 
+-- dummy
 
 CREATE TABLE depotdbtest.eventlog (
      evtid          MEDIUMINT UNSIGNED  NOT NULL
@@ -327,7 +327,7 @@ CREATE TABLE depotdbtest.trade (
    ,prc             DECIMAL(12,6) UNSIGNED NOT NULL
    ,vol             DECIMAL(16,6)       NOT NULL
    ,ccy             CHAR(3)             NOT NULL
-   ,qty_allotted    DECIMAL(16,6) UNSIGNED  NOT NULL
+   ,vol_allotted    DECIMAL(16,6) UNSIGNED  NOT NULL
    ,lastedit        TIMESTAMP
    ,FOREIGN KEY fktrdep (depid)  REFERENCES depotdbtest.depot(depid) ON DELETE CASCADE   
    ,FOREIGN KEY fktrdins (insid) REFERENCES depotdbtest.instrument(insid) ON DELETE RESTRICT
@@ -349,9 +349,9 @@ CREATE INDEX idxpaytrd  ON depotdbtest.payment(trdid,paymenttype);
 
 /* lot offset. Which SELL trades are allotted to which BUY trades? */
 CREATE TABLE depotdbtest.trade_allotment(
-     sell_trdid       MEDIUMINT UNSIGNED NOT NULL
-    ,buy_trdid      MEDIUMINT UNSIGNED NOT NULL
-    ,qty             DECIMAL(16,6) UNSIGNED NOT NULL
+     sell_trdid         MEDIUMINT UNSIGNED NOT NULL
+    ,buy_trdid          MEDIUMINT UNSIGNED NOT NULL
+    ,volume             DECIMAL(16,6) UNSIGNED NOT NULL
     ,FOREIGN KEY fktalsll (sell_trdid) REFERENCES depotdbtest.trade(trdid) ON DELETE CASCADE    
     ,FOREIGN KEY fktalbuy (buy_trdid) REFERENCES depotdbtest.trade(trdid) ON DELETE CASCADE
 );
@@ -363,8 +363,8 @@ CREATE TABLE depotdbtest.position (
    ,depid           SMALLINT UNSIGNED   NOT NULL
    ,insid           SMALLINT UNSIGNED   NOT NULL
    ,valuedate       DATE                NOT NULL 
-   ,qty        DECIMAL(16,6)       NOT NULL
-   ,vol          DECIMAL(16,6)       NOT NULL
+   ,qty             DECIMAL(16,6)       NOT NULL
+   ,vol             DECIMAL(16,6)       NOT NULL
    ,ccy             CHAR(3)             NOT NULL
    ,PRIMARY KEY (posid)
    ,FOREIGN KEY fkposdep (depid) REFERENCES depotdbtest.depot(depid) ON DELETE CASCADE
@@ -497,7 +497,7 @@ CREATE OR REPLACE TABLE
    ,symid           SMALLINT UNSIGNED   NOT NULL
    ,valuedate       DATE                NOT NULL
    ,`close`         DECIMAL(10,4) UNSIGNED NOT NULL
-   ,dividend        DECIMAL(8,2)   NOT NULL DEFAULT 0.0
+   ,dividend        DECIMAL(10,4)   NOT NULL DEFAULT 0.0
    ,split_factor    DECIMAL(16,12) NOT NULL DEFAULT 1.0     
    ,adj_factor      DECIMAL(16,12) NOT NULL DEFAULT (CAST((1-dividend/`close`) * split_factor AS DECIMAL(16,12)))
    ,FOREIGN KEY fkpasymid (symid) REFERENCES depotdbtest.symbol(symid) ON DELETE RESTRICT
@@ -510,7 +510,7 @@ CREATE OR REPLACE TABLE
    ,symbol          VARCHAR(12) NOT NULL
    ,valuedate       DATE                NOT NULL
    ,`close`         DECIMAL(10,4) UNSIGNED NOT NULL
-   ,dividend        DECIMAL(8,2)   NOT NULL DEFAULT 0.0
+   ,dividend        DECIMAL(10,4)   NOT NULL DEFAULT 0.0
    ,split_factor    DECIMAL(16,12) NOT NULL DEFAULT 1.0     
 );
 
@@ -824,6 +824,45 @@ BEGIN
 END;
 //
 DELIMITER ;
+
+
+/*------------------------------------------------------------------------------
+ corporate action: stock split
+------------------------------------------------------------------------------*/
+DELIMITER //
+CREATE OR REPLACE
+    DEFINER = CURRENT_USER
+    PROCEDURE depotdbtest.instrument_spli (
+         IN in_isin CHAR(12)
+        ,IN new_qty DECIMAL(16,13) -- this may become nasty? xxx.yyyyyyyyyyyyy
+        ,IN valid_from DATE)
+    SQL SECURITY DEFINER
+    MODIFIES SQL DATA
+    COMMENT 'Perform a stock split on any position.'
+`proc_body`:
+BEGIN
+    DECLARE l_insid SMALLINT UNSIGNED DEFAULT NULL;
+    IF CHAR_LENGTH(in_isin) <> 12 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Invalid ISIN';
+        LEAVE `proc_body`;
+    END IF;
+    
+    SELECT in_isin REGEXP '[A-Z]{2}[A-Z0-9]{9}[0-9]' INTO @isinchk;
+    IF NOT @isinchk THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Invalid ISIN';
+        LEAVE `proc_body`;
+    END IF;
+    
+    SELECT insid INTO l_insid FROM depotdbtest.instrument WHERE isin = in_isin;
+    IF l_insid IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Instrument does not exist';
+        LEAVE `proc_body`;
+    END IF;
+    
+    UPDATE depotdbtest.position p SET p.qty = p.qty * new_qty WHERE p.insid = l_insid AND p.valuedate >= valid_from;
+    UPDATE depotdbtest.trade    t SET t.qty = t.qty * new_qty WHERE t.insid = l_insid AND t.valuedate >= valid_from; 
+END;
+//
 
 /*------------------------------------------------------------------------------
  _____               _ _               __           _       _       
@@ -1165,12 +1204,11 @@ DELIMITER ;
 * function returning the invested volume amount for a given lot qty
 ------------------------------------------------------------------------------*/
 
-
 /*------------------------------------------------------------------------------
 What is the invested volume for a (hypothetic) sell size?
 ------------------------------------------------------------------------------*/
 DELIMITER //
-CREATE OR REPLACE DEFINER = CURRENT_USER -- 'depotdbtest_admin'@'localhost' 
+CREATE OR REPLACE DEFINER = CURRENT_USER 
 FUNCTION depotdbtest.get_lot_volume(
      in_depid       SMALLINT UNSIGNED 
     ,in_insid       SMALLINT UNSIGNED 
@@ -1186,22 +1224,25 @@ BEGIN
     DECLARE out_volume DOUBLE;
     DECLARE residual_quantity DOUBLE;
     DECLARE exceeded INT DEFAULT FALSE;
+    DECLARE v_vol DOUBLE;
     DECLARE v_qty DOUBLE;
     DECLARE v_prc DOUBLE;
 
     DECLARE crs CURSOR FOR               -- this cursor is used to 
         SELECT                           -- get the result set of those
-            t.qty_allotted, t.prc        -- BUY trades that have not been
+            t.vol_allotted               --
+           ,t.qty                        --
+           ,t.prc                        -- BUY trades that have not been
             FROM                         -- allotted. 
             depotdbtest.trade t              -- We will walk this cursor
         WHERE                            -- until the in_quantity is
             t.depid = in_depid           -- met.
         AND t.insid = in_insid           -- 
         AND t.ccy   = in_ccy             --
-        AND t.qty_allotted > 0           --
+        AND t.vol_allotted > 0           --
         ORDER BY t.valuedate ASC;        --
 
-    /* if we ask for more qty than can be alloted, raise an error */
+    /* if we ask for more vol than can be alloted, raise an error */
     DECLARE CONTINUE HANDLER FOR NOT FOUND SET exceeded = TRUE;
 
     /* the out volume keeps track of the invested volume */
@@ -1212,7 +1253,7 @@ BEGIN
 
     OPEN crs;
     read_loop: LOOP
-        FETCH crs INTO v_qty, v_prc;
+        FETCH crs INTO v_vol, v_qty, v_prc;
         /* If we ask for more than what's available, throw an error*/
         IF exceeded THEN                 
             SIGNAL SQLSTATE '45000'
@@ -1224,7 +1265,7 @@ BEGIN
             LEAVE read_loop;             
         ELSEIF residual_quantity > v_qty THEN
             SET residual_quantity = residual_quantity - v_qty;
-            SET out_volume = out_volume + v_qty * v_prc;
+            SET out_volume = out_volume + v_vol;
         ELSE
             SET out_volume = out_volume + residual_quantity * v_prc;
             LEAVE read_loop;
@@ -1281,7 +1322,7 @@ BEGIN
     DECLARE l_depid     SMALLINT DEFAULT NULL;
     DECLARE l_qty       DECIMAL(16,6);
     DECLARE l_prc       DECIMAL(12,6);
-    DECLARE l_qtylot    DECIMAL(16,6);
+    DECLARE l_vollot    DECIMAL(16,6);
     DECLARE lotvolume   DECIMAL(16,6);
     DECLARE l_vdate     DATE;
     DECLARE l_vol       DECIMAL(16,6);
@@ -1325,9 +1366,9 @@ BEGIN
         SET l_vdate = JSON_VALUE(in_json,'$.valuedate');
         SET l_vol =   l_qty * l_prc;
         IF l_qty < 0 THEN 
-            SET l_qtylot = 0.0; 
+            SET l_vollot = 0.0; 
         ELSE
-            SET l_qtylot = l_qty;
+            SET l_vollot = l_vol;
         END IF;
         
         START TRANSACTION;
@@ -1341,9 +1382,9 @@ BEGIN
             END IF;
             -- book trade, get the trade id
             INSERT INTO depotdbtest.trade 
-                (depid,insid,valuedate,qty,prc,vol,ccy,qty_allotted) 
+                (depid,insid,valuedate,qty,prc,vol,ccy,vol_allotted) 
             VALUES 
-                (l_depid,l_insid,l_vdate,l_qty,l_prc,l_vol,l_ccy,l_qtylot);
+                (l_depid,l_insid,l_vdate,l_qty,l_prc,l_vol,l_ccy,l_vollot);
             SET l_trdid = LAST_INSERT_ID();
             
             -- book the buy / sell cashflow
@@ -1357,17 +1398,33 @@ BEGIN
                 -- CALL depotdbtest.book_payment(l_trdid,'pnl',-1.0 * l_vol - lotvolume, l_ccy);
                 INSERT INTO depotdbtest.payment(trdid,paymenttype,amount,ccy) 
                     VALUES (l_trdid,'pnl',-1.0 * l_vol - lotvolume,l_ccy);
-                CALL depotdbtest.decrease_qty_allotted(l_trdid,l_depid,l_insid,-1.0 * l_qty,l_ccy);
+                CALL depotdbtest.decrease_vol_allotted(l_trdid,l_depid,l_insid,-1.0 * l_vollot,l_ccy);
             END IF;
   
             -- add a row to the position table!
-            SELECT SUM(t.qty_allotted), SUM(t.qty_allotted * t.prc) 
-                INTO l_posqty,l_posvol 
-                FROM depotdbtest.trade t
-                WHERE t.depid = l_depid 
-                AND t.insid = l_insid 
-                AND t.ccy = l_ccy;
-                
+            SELECT CAST(COALESCE(p.qty,0) + l_qty AS DECIMAL(16,6)), CAST(COALESCE(p.vol,0) + l_vol AS DECIMAL(16,6)) INTO l_posqty, l_posvol
+            FROM depotdbtest.position p 
+            INNER JOIN (
+                SELECT 
+                     p0.depid
+                    ,p0.insid
+                    ,p0.ccy
+                    ,MAX(p0.valuedate) AS lastDate 
+                FROM depotdbtest.position p0
+                WHERE p0.depid = l_depid 
+                AND   p0.insid = l_insid
+                AND   p0.ccy   = l_ccy
+                ) pLast
+            ON  p.depid = pLast.depid
+            AND p.insid = pLast.insid
+            AND p.ccy   = pLast.ccy
+            AND p.valuedate = pLast.lastDate;
+            
+            IF l_posqty IS NULL THEN
+                SET l_posqty = l_qty;
+                SET l_posvol = l_vol;
+            END IF;
+            
             INSERT INTO depotdbtest.position 
                 (depid,insid,valuedate,qty,vol,ccy)
             VALUES (l_depid,l_insid,l_vdate,l_posqty,l_posvol,l_ccy)
@@ -1505,11 +1562,11 @@ DELIMITER ;
 ------------------------------------------------------------------------------*/
 DELIMITER //
 CREATE OR REPLACE DEFINER = CURRENT_USER 
-    PROCEDURE depotdbtest.decrease_qty_allotted(
+    PROCEDURE depotdbtest.decrease_vol_allotted(
      IN in_trdid MEDIUMINT
     ,IN in_depid SMALLINT  
     ,IN in_insid SMALLINT 
-    ,IN in_sell_qty DECIMAL(16,6)
+    ,IN in_sell_vol DECIMAL(16,6)
     ,IN in_ccy CHAR(3))
     SQL SECURITY DEFINER
     MODIFIES SQL DATA
@@ -1520,17 +1577,17 @@ BEGIN
     DECLARE v_trdid MEDIUMINT UNSIGNED DEFAULT NULL;
     DECLARE v_lot DECIMAL(16,6); 
     DECLARE l_depid SMALLINT UNSIGNED DEFAULT NULL;
-    DECLARE sell_qty DECIMAL(16,6);
+    DECLARE sell_vol DECIMAL(16,6);
 
     DECLARE crs CURSOR FOR 
         SELECT                       -- This is quite like the cursor in
-            t.trdid, t.qty_allotted  -- get_lot_volume, but this time we
+            t.trdid, t.vol_allotted  -- get_lot_volume, but this time we
         FROM                         -- require trdid and quantity, only.
             depotdbtest.trade t          -- 
         WHERE t.depid = in_depid     --
         AND t.insid = in_insid       --
         AND t.ccy = in_ccy           --
-        AND t.qty_allotted > 0       --
+        AND t.vol_allotted > 0       --
         ORDER BY t.valuedate ASC;    --
 
     DECLARE CONTINUE HANDLER FOR NOT FOUND SET exceeded = TRUE;
@@ -1545,36 +1602,35 @@ BEGIN
         LEAVE proc_body;
     END IF;
 
-    IF in_sell_qty < 0 THEN 
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Sell qty must be positive.';
+    IF in_sell_vol < 0 THEN 
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Sell volume must be positive.';
         LEAVE proc_body;
     END IF;                
-    SET sell_qty = in_sell_qty;
+    SET sell_vol = in_sell_vol;
     OPEN crs;
     read_loop: LOOP
         FETCH crs INTO v_trdid,v_lot;
         IF exceeded THEN                 
             SIGNAL SQLSTATE '45000'
-            SET MESSAGE_TEXT = 'Excess qty cannot be allotted';
+            SET MESSAGE_TEXT = 'Excess volume cannot be allotted';
         END IF;
-        IF sell_qty > v_lot THEN
-            SET sell_qty = sell_qty - v_lot;
+        IF sell_vol > v_lot THEN
+            SET sell_vol = sell_vol - v_lot;
             UPDATE depotdbtest.trade t 
-                SET t.qty_allotted = 0.0 
+                SET t.vol_allotted = 0.0 
                 WHERE t.trdid = v_trdid;
-            INSERT INTO depotdbtest.trade_allotment (sell_trdid,buy_trdid,qty) VALUES (in_trdid,v_trdid,v_lot);
+            INSERT INTO depotdbtest.trade_allotment (sell_trdid,buy_trdid,volume) VALUES (in_trdid,v_trdid,v_lot);
         ELSE       
             UPDATE depotdbtest.trade t 
-                SET t.qty_allotted = t.qty_allotted - sell_qty 
+                SET t.vol_allotted = t.vol_allotted - sell_vol 
                 WHERE t.trdid = v_trdid;
-            INSERT INTO depotdbtest.trade_allotment (sell_trdid,buy_trdid,qty) VALUES (in_trdid,v_trdid,sell_qty);
+            INSERT INTO depotdbtest.trade_allotment (sell_trdid,buy_trdid,volume) VALUES (in_trdid,v_trdid,sell_vol);
             LEAVE read_loop; 
         END IF;    
     END LOOP;
     CLOSE crs;
 END; //
 DELIMITER ;
-
 
 
 /* add a vendor market mapping */
@@ -1743,7 +1799,7 @@ CREATE OR REPLACE DEFINER = CURRENT_USER
     ,IN in_symbol VARCHAR(12) 
     ,IN in_valuedate DATE
     ,IN in_close DECIMAL(10,4)
-    ,IN in_dividend DECIMAL(8,2)
+    ,IN in_dividend DECIMAL(10,4)
     ,IN in_split_factor DECIMAL(16,12))
     SQL SECURITY DEFINER
     MODIFIES SQL DATA

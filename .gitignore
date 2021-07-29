@@ -5,3 +5,4 @@ Readme.Rmd
 backup/
 jupyter/.ipynb_checkpoints/
 setenv/
+market/*.csv
